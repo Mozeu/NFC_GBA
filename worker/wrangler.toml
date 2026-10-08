@@ -1,0 +1,14 @@
+name = "roms"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "ROMS"
+bucket_name = "roms"
+
+[vars]
+# Solo el origen, sin ruta ni barra final
+ALLOWED_ORIGIN = "https://mozeu.github.io"
+
+# El token NO va aquí. Se guarda como secreto:
+#   npx wrangler secret put TOKEN
