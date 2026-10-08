@@ -49,6 +49,31 @@
     window.EJS_gameUrl = URL.createObjectURL(blob);
     window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
     window.EJS_startOnLoaded = true;
+    const stateKey = "state:" + id;
+    async function autosave() {
+      try {
+        const s = EJS_emulator.gameManager.getState(); // Uint8Array
+        if (s && s.length) await putRom(stateKey, new Blob([s]));
+      } catch (e) { /* el emulador aún no está listo */ }
+    }
+
+    window.EJS_onGameStart = async () => {
+      // 1. Cargar el último estado guardado
+      const saved = await getRom(stateKey);
+      if (saved) {
+        const buf = new Uint8Array(await saved.arrayBuffer());
+        setTimeout(() => EJS_emulator.gameManager.loadState(buf), 500);
+      }
+
+      // 2. Autoguardar cada 10 segundos
+      setInterval(autosave, 10000);
+
+      // 3. Y al salir o cambiar de app
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) autosave();
+      });
+      window.addEventListener("pagehide", autosave);
+    };
     const s = document.createElement("script");
     s.src = "https://cdn.emulatorjs.org/stable/data/loader.js";
     document.body.appendChild(s);
