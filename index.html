@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mi emulador</title>
+  <style>
+    body { margin:0; background:#111; color:#fff; font-family:sans-serif; }
+    #game { width:100vw; height:100vh; }
+    #setup { padding:20px; }
+  </style>
+</head>
+<body>
+  <div id="setup" hidden>
+    <h2 id="msg"></h2>
+    <input type="file" id="romfile" accept=".gba,.gbc,.gb,.nds,.sfc,.smc">
+  </div>
+  <div id="game"></div>
+
+  <script>
+  // --- Catálogo: id del tag -> core del emulador ---
+  const GAMES = {
+    esmeralda: { core: "gba", title: "Pokémon Esmeralda" },
+    rojo:      { core: "gb",  title: "Pokémon Rojo" },
+    oro:       { core: "gbc", title: "Pokémon Oro" },
+  };
+
+  // --- IndexedDB mínimo para guardar ROMs ---
+  const db = new Promise((res, rej) => {
+    const r = indexedDB.open("roms", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("files");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  const store = async (mode) => (await db).transaction("files", mode).objectStore("files");
+  const getRom = async (k) => new Promise(async (res) => {
+    const q = (await store("readonly")).get(k); q.onsuccess = () => res(q.result);
+  });
+  const putRom = async (k, blob) => new Promise(async (res) => {
+    const q = (await store("readwrite")).put(blob, k); q.onsuccess = res;
+  });
+
+  // --- Lanzar el emulador ---
+  function start(id, blob) {
+    document.getElementById("setup").hidden = true;
+    window.EJS_gameName = id;
+    window.EJS_player = "#game";
+    window.EJS_core = GAMES[id].core;
+    window.EJS_gameUrl = URL.createObjectURL(blob);
+    window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
+    window.EJS_startOnLoaded = true;
+    const s = document.createElement("script");
+    s.src = "https://cdn.emulatorjs.org/stable/data/loader.js";
+    document.body.appendChild(s);
+  }
+
+  // --- Lógica principal ---
+  (async () => {
+    const id = new URLSearchParams(location.search).get("game");
+    const setup = document.getElementById("setup");
+    if (!GAMES[id]) {
+      setup.hidden = false;
+      document.getElementById("msg").textContent = "Escanea un tag NFC válido";
+      return;
+    }
+    const rom = await getRom(id);
+    if (rom) return start(id, rom);
+
+    // Primera vez: pedir la ROM al usuario
+    setup.hidden = false;
+    document.getElementById("msg").textContent = `Carga tu ROM de ${GAMES[id].title} (solo la primera vez)`;
+    document.getElementById("romfile").onchange = async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      await putRom(id, f);
+      start(id, f);
+    };
+  })();
+  </script>
+</body>
+</html>
