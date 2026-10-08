@@ -1,106 +1,186 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mi emulador</title>
-  <style>
-    body { margin:0; background:#111; color:#fff; font-family:sans-serif; }
-    #game { width:100vw; height:100vh; height:100dvh;}
-    #setup { padding:20px; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.json">
+<title>Mi emulador</title>
+<style>
+  html, body { margin:0; height:100%; background:#111; color:#fff; font-family:system-ui,sans-serif; }
+  #game { width:100vw; height:100vh; }
+  .screen { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+            justify-content:center; gap:16px; padding:24px; text-align:center; background:#111; z-index:10; }
+  .screen[hidden] { display:none; }
+  button, .btn, input[type=file]::file-selector-button {
+    background:#e53935; color:#fff; border:0; border-radius:10px; padding:14px 28px;
+    font-size:18px; cursor:pointer; text-decoration:none; }
+  a.btn { display:block; margin:6px 0; }
+  p { margin:0; opacity:.8; }
+</style>
 </head>
 <body>
-  <div id="setup" hidden>
-    <h2 id="msg"></h2>
-    <input type="file" id="romfile" accept=".gba,.gbc,.gb,.nds,.sfc,.smc">
-  </div>
-  <div id="game"></div>
 
-  <script>
-  // --- Catálogo: id del tag -> core del emulador ---
-  const GAMES = {
-    esmeralda: { core: "gba", title: "Pokémon Esmeralda" },
-    rojo:      { core: "gb",  title: "Pokémon Rojo" },
-    oro:       { core: "gbc", title: "Pokémon Oro" },
-  };
+<!-- Pantalla de mensajes / carga de ROM / menú -->
+<div id="setup" class="screen" hidden>
+  <h2 id="msg"></h2>
+  <p id="sub"></p>
+  <input type="file" id="romfile" accept=".gba,.gbc,.gb,.nds,.sfc,.smc,.nes" hidden>
+  <div id="menu"></div>
+</div>
 
-  // --- IndexedDB mínimo para guardar ROMs ---
-  const db = new Promise((res, rej) => {
-    const r = indexedDB.open("roms", 1);
-    r.onupgradeneeded = () => r.result.createObjectStore("files");
-    r.onsuccess = () => res(r.result);
-    r.onerror = () => rej(r.error);
+<!-- Pantalla "Toca para continuar" (desbloquea audio y evita pantalla en blanco) -->
+<div id="tap" class="screen" hidden>
+  <h2 id="tapTitle"></h2>
+  <button id="tapBtn">▶ Toca para continuar</button>
+</div>
+
+<div id="game"></div>
+
+<script>
+/* =====================  CONFIGURACIÓN  ===================== */
+const GAMES = {
+  esmeralda: { core: "gba", title: "Pokémon Esmeralda", file: "esmeralda.gba" },
+  rojo:      { core: "gb",  title: "Pokémon Rojo",      file: "rojo.gb"       },
+  oro:       { core: "gb",  title: "Pokémon Oro",       file: "oro.gbc"       },
+};
+
+// Fase 3 (opcional): deja "" para cargar la ROM a mano.
+// Cuando tengas tu Worker de Cloudflare, pon aquí su URL.
+const ROM_SERVER = "";
+
+const AUTOSAVE_MS = 10000;
+/* ========================================================== */
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- IndexedDB mínimo ---------- */
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open("roms", 1);
+  r.onupgradeneeded = () => r.result.createObjectStore("files");
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+async function kvGet(k) {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const q = db.transaction("files", "readonly").objectStore("files").get(k);
+    q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
   });
-  const store = async (mode) => (await db).transaction("files", mode).objectStore("files");
-  const getRom = async (k) => new Promise(async (res) => {
-    const q = (await store("readonly")).get(k); q.onsuccess = () => res(q.result);
+}
+async function kvPut(k, v) {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const q = db.transaction("files", "readwrite").objectStore("files").put(v, k);
+    q.onsuccess = () => res(); q.onerror = () => rej(q.error);
   });
-  const putRom = async (k, blob) => new Promise(async (res) => {
-    const q = (await store("readwrite")).put(blob, k); q.onsuccess = res;
+}
+
+/* ---------- Pantallas ---------- */
+function showSetup(title, sub = "") {
+  $("tap").hidden = true;
+  $("setup").hidden = false;
+  $("msg").textContent = title;
+  $("sub").textContent = sub;
+  $("menu").innerHTML = "";
+  $("romfile").hidden = true;
+}
+
+function showMenu() {
+  showSetup("Elige un juego", "O escanea un tag NFC");
+  for (const [id, g] of Object.entries(GAMES)) {
+    const a = document.createElement("a");
+    a.className = "btn"; a.textContent = g.title; a.href = "?game=" + id;
+    $("menu").appendChild(a);
+  }
+}
+
+/* ---------- Descarga remota (Fase 3) ---------- */
+async function downloadRom(id, token) {
+  const r = await fetch(`${ROM_SERVER}/${GAMES[id].file}`, {
+    headers: { Authorization: `Bearer ${token}` },
   });
+  if (!r.ok) throw new Error("No se pudo descargar la ROM (" + r.status + ")");
+  return await r.blob();
+}
 
-  // --- Lanzar el emulador ---
-  function start(id, blob) {
-    document.getElementById("setup").hidden = true;
-    window.EJS_gameName = id;
-    window.EJS_player = "#game";
-    window.EJS_core = GAMES[id].core;
-    window.EJS_gameUrl = URL.createObjectURL(blob);
-    window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
-    window.EJS_startOnLoaded = true;
-    const stateKey = "state:" + id;
-    async function autosave() {
-      try {
-        const s = EJS_emulator.gameManager.getState(); // Uint8Array
-        if (s && s.length) await putRom(stateKey, new Blob([s]));
-      } catch (e) { /* el emulador aún no está listo */ }
-    }
+/* ---------- Arrancar el emulador ---------- */
+function start(id, rom, fresh) {
+  const stateKey = "state:" + id;
+  $("tap").hidden = true;
+  $("setup").hidden = true;
 
-    window.EJS_onGameStart = async () => {
-      // 1. Cargar el último estado guardado
-      const saved = await getRom(stateKey);
-      if (saved) {
-        const buf = new Uint8Array(await saved.arrayBuffer());
-        setTimeout(() => EJS_emulator.gameManager.loadState(buf), 500);
-      }
-
-      // 2. Autoguardar cada 10 segundos
-      setInterval(autosave, 10000);
-
-      // 3. Y al salir o cambiar de app
-      document.addEventListener("visibilitychange", () => {
-        if (document.hidden) autosave();
-      });
-      window.addEventListener("pagehide", autosave);
-    };
-    const s = document.createElement("script");
-    s.src = "https://cdn.emulatorjs.org/stable/data/loader.js";
-    document.body.appendChild(s);
+  async function autosave() {
+    try {
+      const s = EJS_emulator.gameManager.getState();
+      if (s && s.length) await kvPut(stateKey, new Blob([s]));
+    } catch (e) { /* el emulador aún no está listo */ }
   }
 
-  // --- Lógica principal ---
-  (async () => {
-    const id = new URLSearchParams(location.search).get("game");
-    const setup = document.getElementById("setup");
-    if (!GAMES[id]) {
-      setup.hidden = false;
-      document.getElementById("msg").textContent = "Escanea un tag NFC válido";
-      return;
-    }
-    const rom = await getRom(id);
-    if (rom) return start(id, rom);
+  window.EJS_player = "#game";
+  window.EJS_core = GAMES[id].core;
+  window.EJS_gameName = id;
+  window.EJS_gameUrl = URL.createObjectURL(rom);
+  window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
+  window.EJS_startOnLoaded = true;
 
-    // Primera vez: pedir la ROM al usuario
-    setup.hidden = false;
-    document.getElementById("msg").textContent = `Carga tu ROM de ${GAMES[id].title} (solo la primera vez)`;
-    document.getElementById("romfile").onchange = async (e) => {
+  window.EJS_onGameStart = async () => {
+    if (!fresh) {
+      const saved = await kvGet(stateKey);
+      if (saved) {
+        const buf = new Uint8Array(await saved.arrayBuffer());
+        setTimeout(() => { try { EJS_emulator.gameManager.loadState(buf); } catch (e) {} }, 800);
+      }
+    }
+    setInterval(autosave, AUTOSAVE_MS);
+    document.addEventListener("visibilitychange", () => { if (document.hidden) autosave(); });
+    window.addEventListener("pagehide", autosave);
+  };
+
+  const s = document.createElement("script");
+  s.src = "https://cdn.emulatorjs.org/stable/data/loader.js";
+  document.body.appendChild(s);
+}
+
+/* ---------- Lógica principal ---------- */
+(async () => {
+  const params = new URLSearchParams(location.search);
+  const id = params.get("game");
+  const fresh = params.get("fresh") === "1";   // ?fresh=1 ignora el autoguardado
+  const token = new URLSearchParams(location.hash.slice(1)).get("token");
+
+  if (!GAMES[id]) return showMenu();
+
+  let rom = await kvGet(id);
+
+  // Descarga remota si hay servidor configurado
+  if (!rom && ROM_SERVER && token) {
+    showSetup(`Descargando ${GAMES[id].title}...`, "Solo la primera vez");
+    try { rom = await downloadRom(id, token); await kvPut(id, rom); }
+    catch (e) { showSetup("Error", e.message); return; }
+  }
+
+  // Carga manual
+  if (!rom) {
+    showSetup(`Carga tu ROM de ${GAMES[id].title}`, "Solo la primera vez");
+    const input = $("romfile");
+    input.hidden = false;
+    input.onchange = async (e) => {
       const f = e.target.files[0];
       if (!f) return;
-      await putRom(id, f);
-      start(id, f);
+      await kvPut(id, f);
+      location.reload();   // vuelve a entrar por el flujo normal con toque
     };
-  })();
-  </script>
+    return;
+  }
+
+  // ROM lista: pedir un toque para arrancar (evita pantalla en blanco)
+  $("tapTitle").textContent = GAMES[id].title;
+  $("tap").hidden = false;
+  $("tapBtn").onclick = () => start(id, rom, fresh);
+})();
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
 </body>
 </html>

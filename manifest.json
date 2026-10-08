@@ -1,0 +1,10 @@
+{
+  "name": "Mi emulador",
+  "short_name": "Emulador",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#111111",
+  "theme_color": "#111111"
+}
