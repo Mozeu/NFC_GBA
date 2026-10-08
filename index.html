@@ -25,7 +25,7 @@
 <div id="setup" class="screen" hidden>
   <h2 id="msg"></h2>
   <p id="sub"></p>
-  <input type="file" id="romfile" accept=".gba,.gbc,.gb,.nds,.sfc,.smc,.nes" hidden>
+  <input type="file" id="romfile" hidden>
   <div id="menu"></div>
 </div>
 
@@ -166,19 +166,38 @@ function start(id, rom, fresh) {
     const input = $("romfile");
     input.hidden = false;
     input.onchange = async (e) => {
-      const f = e.target.files[0];
+      const f = e.target.files && e.target.files[0];
       if (!f) return;
-      await kvPut(id, f);
-      location.reload();   // vuelve a entrar por el flujo normal con toque
+      $("sub").textContent = `Guardando ${f.name}...`;
+      try {
+        // Copiamos los bytes a memoria: en móvil, guardar el File directo
+        // puede fallar porque solo es una referencia al archivo del sistema.
+        const buf = await f.arrayBuffer();
+        if (!buf.byteLength) throw new Error("El archivo está vacío o no se pudo leer");
+        const copy = new Blob([buf]);
+        await kvPut(id, copy);
+        const check = await kvGet(id);
+        if (!check || !check.size) throw new Error("No se pudo guardar en el navegador");
+        input.hidden = true;
+        showTap(id, check, fresh);   // sin recargar la página
+      } catch (err) {
+        $("sub").textContent = "Error: " + err.message;
+        input.value = "";
+      }
     };
     return;
   }
 
-  // ROM lista: pedir un toque para arrancar (evita pantalla en blanco)
+  showTap(id, rom, fresh);
+})();
+
+// ROM lista: pedir un toque para arrancar (evita pantalla en blanco)
+function showTap(id, rom, fresh) {
+  $("setup").hidden = true;
   $("tapTitle").textContent = GAMES[id].title;
   $("tap").hidden = false;
   $("tapBtn").onclick = () => start(id, rom, fresh);
-})();
+}
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
