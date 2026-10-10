@@ -47,9 +47,9 @@ const GAMES = {
 
 // Fase 3 (opcional): deja "" para cargar la ROM a mano.
 // Cuando tengas tu Worker de Cloudflare, pon aquí su URL.
-const ROM_SERVER = "https://roms.pokenfc.workers.dev";
+const ROM_SERVER = "";
 
-const AUTOSAVE_MS = 10000;
+const AUTOSAVE_MS = 60000;   // cada guardado serializa todo el estado: cuanto más espaciado, menos tirones
 /* ========================================================== */
 
 const $ = (id) => document.getElementById(id);
@@ -110,11 +110,57 @@ function start(id, rom, fresh) {
   $("tap").hidden = true;
   $("setup").hidden = true;
 
+  // Modo ligero: sin autoguardado periódico (solo al salir de la app).
+  // ?lite=1 lo activa y lo recuerda en este teléfono; ?lite=0 lo desactiva.
+  const qp = new URLSearchParams(location.search);
+  try {
+    if (qp.get("lite") === "1") localStorage.setItem("lite", "1");
+    if (qp.get("lite") === "0") localStorage.removeItem("lite");
+  } catch (e) {}
+  let lite = false;
+  try { lite = localStorage.getItem("lite") === "1"; } catch (e) {}
+  let timer = null, saving = false;
+
   async function autosave() {
+    if (saving) return;              // evita guardados solapados
+    saving = true;
     try {
       const s = EJS_emulator.gameManager.getState();
       if (s && s.length) await kvPut(stateKey, new Blob([s]));
     } catch (e) { /* el emulador aún no está listo */ }
+    finally { saving = false; }
+  }
+
+  function schedule() {
+    if (timer || lite) return;
+    timer = setInterval(() => {
+      if (document.hidden) return;   // si está en segundo plano, ya se guardó al ocultarse
+      // Esperar un hueco libre para no pisar la emulación
+      (window.requestIdleCallback || ((f) => setTimeout(f, 0)))(autosave, { timeout: 5000 });
+    }, AUTOSAVE_MS);
+  }
+
+  function goLite() {
+    lite = true;
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  // Si el teléfono va por debajo de ~50 FPS, desactiva el autoguardado periódico
+  // (solo durante esta sesión). Se mide tras 5 s para ignorar la carga inicial.
+  function watchFps() {
+    if (lite) return;
+    let frames = 0, t0 = 0, aborted = false;
+    const abort = () => { aborted = true; };
+    document.addEventListener("visibilitychange", abort, { once: true });
+    function tick(t) {
+      if (aborted) return;           // la pestaña se ocultó: la medición no vale
+      if (!t0) t0 = t;
+      frames++;
+      if (t - t0 < 6000) return requestAnimationFrame(tick);
+      document.removeEventListener("visibilitychange", abort);
+      if (frames / ((t - t0) / 1000) < 50) goLite();
+    }
+    requestAnimationFrame(tick);
   }
 
   window.EJS_player = "#game";
@@ -132,7 +178,8 @@ function start(id, rom, fresh) {
         setTimeout(() => { try { EJS_emulator.gameManager.loadState(buf); } catch (e) {} }, 800);
       }
     }
-    setInterval(autosave, AUTOSAVE_MS);
+    schedule();
+    setTimeout(watchFps, 5000);
     document.addEventListener("visibilitychange", () => { if (document.hidden) autosave(); });
     window.addEventListener("pagehide", autosave);
   };
