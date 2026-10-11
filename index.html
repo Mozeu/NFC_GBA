@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#111111">
 <link rel="manifest" href="manifest.json">
+<link rel="preconnect" href="https://cdn.emulatorjs.org" crossorigin>
 <title>Mi emulador</title>
 <style>
   html, body { margin:0; height:100%; background:#111; color:#fff; font-family:system-ui,sans-serif; }
@@ -37,10 +38,9 @@
 
 <script>
 /* =====================  CONFIGURACIÓN  ===================== */
-// Un juego por tag. El juego lo decide el TOKEN del tag, ya no el ?game= de la URL.
-//  - Usa los MISMOS ids que en tu index.html actual: así se reutilizan las ROMs
-//    y las partidas ya guardadas en el teléfono (si cambias un id, se vuelve a descargar).
+// Un juego por tag. El juego lo decide el TOKEN del tag, no la URL.
 //  - "hash" lo imprime tools/generar-tokens.mjs. Es seguro publicarlo.
+//  - Usa los mismos ids de siempre para conservar ROMs y partidas ya guardadas.
 const GAMES = {
   esmeralda: { core: "gba", title: "Pokémon Esmeralda",  hash: "f8d794244094a14ef5c593cfcf7b0224251f1e270acfadb94a9571869b08e246" },
   rojo:      { core: "gba", title: "Pokémon Rojo Fuego", hash: "ac8bfbf17a215f390cd36a13048ae2595648fbfaf802f02154da0d0ed11c71e9" },
@@ -50,18 +50,31 @@ const GAMES = {
 // Si la dejas "" no se descarga nada y la ROM se carga a mano.
 const ROM_SERVER = "https://roms.pokenfc.workers.dev";
 
-const AUTOSAVE_MS = 60000;   // cada guardado serializa todo el estado: cuanto más espaciado, menos tirones
+// Versión FIJA de EmulatorJS (no "stable"): la caché guarda archivos de una sola versión
+// y no se mezclan si EmulatorJS publica una nueva. Si algún día la cambias, sube también
+// el número de CACHE en sw.js.
+const EJS_DATA = "https://cdn.emulatorjs.org/4.2.3/data/";
+
+// Núcleo de EmulatorJS por sistema, para precargarlo la primera vez. Si un sistema no
+// está aquí no pasa nada: su núcleo se descarga y guarda al jugar por primera vez.
+const CORE_FILES = { gba: "mgba" };
 /* ========================================================== */
 
 const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* ---------- Opciones de la URL que siguen funcionando ---------- */
-// Se leen ANTES de limpiar la barra de direcciones.
-const Q = new URLSearchParams(location.search);   // ?fresh=1  ?lite=1  ?lite=0
-try {
-  if (Q.get("lite") === "1") localStorage.setItem("lite", "1");
-  if (Q.get("lite") === "0") localStorage.removeItem("lite");
-} catch (e) {}
+// Se lee ANTES de limpiar la barra de direcciones. ?fresh=1 empieza sin reanudar.
+const Q = new URLSearchParams(location.search);
+
+/* ---------- Service worker ---------- */
+// Se registra al principio y se espera a que esté activo antes de descargar,
+// para que lo descargado quede guardado en su caché.
+const swReady = ("serviceWorker" in navigator)
+  ? Promise.race([
+      navigator.serviceWorker.register("sw.js").then(() => navigator.serviceWorker.ready),
+      sleep(4000),
+    ]).catch(() => {})
+  : Promise.resolve();
 
 /* ---------- IndexedDB mínimo ---------- */
 const dbp = new Promise((res, rej) => {
@@ -118,7 +131,7 @@ async function gameForToken(token) {
   return Object.keys(GAMES).find((id) => GAMES[id].hash === h) || null;
 }
 
-/* ---------- Descarga remota ---------- */
+/* ---------- Descargas de la primera vez ---------- */
 // El Worker decide qué ROM devolver según el token; la ruta no cuenta.
 async function downloadRom(token) {
   const r = await fetch(`${ROM_SERVER}/rom`, { headers: { Authorization: `Bearer ${token}` } });
@@ -128,89 +141,77 @@ async function downloadRom(token) {
   return blob;
 }
 
+// ¿Ya tiene el teléfono guardado el emulador? Sin Cache API no se puede guardar nada.
+async function emulatorCached() {
+  if (!("caches" in window)) return true;
+  try { return !!(await caches.match(EJS_DATA + "emulator.min.js")); } catch (e) { return true; }
+}
+
+// Pide por adelantado los archivos del emulador. El service worker los guarda, y las
+// siguientes veces cargan desde el teléfono, sin red. Nunca falla: lo que no llegue
+// aquí se guardará al jugar.
+async function warmup(id) {
+  await swReady;
+  const core = CORE_FILES[GAMES[id].core];
+  const files = ["loader.js", "emulator.min.js", "emulator.min.css"];
+  if (core) files.push(`cores/reports/${core}.json`, `cores/${core}-wasm.data`);
+  await Promise.all(files.map((f) =>
+    fetch(EJS_DATA + f).then((r) => (r.ok ? r.arrayBuffer() : null)).catch(() => null)
+  ));
+}
+
 /* ---------- Arrancar el emulador ---------- */
-function start(id, rom, fresh) {
-  const stateKey = "state:" + id;
+// Sin autoguardado periódico: guardar el estado en pleno juego congela unos milisegundos.
+// Se guarda UNA vez, cuando sales de la app o cambias de pestaña (y no hay nadie jugando).
+function start(id, rom, state) {
   $("tap").hidden = true;
   $("setup").hidden = true;
 
-  // Modo ligero: sin autoguardado periódico (solo al salir de la app).
-  // ?lite=1 lo activa y lo recuerda en este teléfono; ?lite=0 lo desactiva.
-  let lite = false;
-  try { lite = localStorage.getItem("lite") === "1"; } catch (e) {}
-  let timer = null, saving = false;
+  const stateKey = "state:" + id;
+  let started = false, saving = false;
 
-  async function autosave() {
-    if (saving) return;              // evita guardados solapados
+  async function save() {
+    if (!started || saving) return;   // antes de arrancar no hay nada que guardar
     saving = true;
     try {
       const s = EJS_emulator.gameManager.getState();
       if (s && s.length) await kvPut(stateKey, new Blob([s]));
-    } catch (e) { /* el emulador aún no está listo */ }
+    } catch (e) { /* el emulador no está listo */ }
     finally { saving = false; }
-  }
-
-  function schedule() {
-    if (timer || lite) return;
-    timer = setInterval(() => {
-      if (document.hidden) return;   // si está en segundo plano, ya se guardó al ocultarse
-      // Esperar un hueco libre para no pisar la emulación
-      (window.requestIdleCallback || ((f) => setTimeout(f, 0)))(autosave, { timeout: 5000 });
-    }, AUTOSAVE_MS);
-  }
-
-  function goLite() {
-    lite = true;
-    if (timer) { clearInterval(timer); timer = null; }
-  }
-
-  // Si el teléfono va por debajo de ~50 FPS, desactiva el autoguardado periódico
-  // (solo durante esta sesión). Se mide tras 5 s para ignorar la carga inicial.
-  function watchFps() {
-    if (lite) return;
-    let frames = 0, t0 = 0, aborted = false;
-    const abort = () => { aborted = true; };
-    document.addEventListener("visibilitychange", abort, { once: true });
-    function tick(t) {
-      if (aborted) return;           // la pestaña se ocultó: la medición no vale
-      if (!t0) t0 = t;
-      frames++;
-      if (t - t0 < 6000) return requestAnimationFrame(tick);
-      document.removeEventListener("visibilitychange", abort);
-      if (frames / ((t - t0) / 1000) < 50) goLite();
-    }
-    requestAnimationFrame(tick);
   }
 
   window.EJS_player = "#game";
   window.EJS_core = GAMES[id].core;
   window.EJS_gameName = id;
   window.EJS_gameUrl = URL.createObjectURL(rom);
-  window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
+  // El estado se lee antes de arrancar y EmulatorJS lo aplica solo al empezar.
+  window.EJS_loadStateURL = state && state.size ? URL.createObjectURL(state) : "";
+  window.EJS_pathtodata = EJS_DATA;
   window.EJS_startOnLoaded = true;
+  window.EJS_onGameStart = () => { started = true; };
 
-  window.EJS_onGameStart = async () => {
-    if (!fresh) {
-      const saved = await kvGet(stateKey);
-      if (saved) {
-        const buf = new Uint8Array(await saved.arrayBuffer());
-        setTimeout(() => { try { EJS_emulator.gameManager.loadState(buf); } catch (e) {} }, 800);
-      }
-    }
-    schedule();
-    setTimeout(watchFps, 5000);
-    document.addEventListener("visibilitychange", () => { if (document.hidden) autosave(); });
-    window.addEventListener("pagehide", autosave);
-  };
+  document.addEventListener("visibilitychange", () => { if (document.hidden) save(); });
+  window.addEventListener("pagehide", save);
 
   const s = document.createElement("script");
-  s.src = "https://cdn.emulatorjs.org/stable/data/loader.js";
+  s.src = EJS_DATA + "loader.js";
   document.body.appendChild(s);
+}
+
+// ROM lista: pedir un toque para arrancar (evita pantalla en blanco por autoplay).
+// Mientras tanto se lee el estado guardado, para no hacerlo con el juego ya en marcha.
+async function ready(id, rom, fresh) {
+  let state = null;
+  if (!fresh) { try { state = await kvGet("state:" + id); } catch (e) {} }
+  $("setup").hidden = true;
+  $("tapTitle").textContent = GAMES[id].title;
+  $("tap").hidden = false;
+  $("tapBtn").onclick = () => start(id, rom, state);
 }
 
 /* ---------- Lógica principal ---------- */
 (async () => {
-  const fresh = Q.get("fresh") === "1";   // ?fresh=1 ignora el autoguardado
+  const fresh = Q.get("fresh") === "1";
 
   // Antes de tocar la URL: ¿están pegados los hashes?
   if (!Object.values(GAMES).every((g) => /^[0-9a-f]{64}$/.test(g.hash))) {
@@ -226,13 +227,23 @@ function start(id, rom, fresh) {
     return showSetup("Tag no reconocido", "Si es un tag antiguo, reescríbelo con la URL nueva.");
   }
 
-  let rom = await kvGet(id);
+  // Que el navegador no borre ROMs, partidas ni caché cuando falte espacio.
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) {}
 
-  // Descarga remota (solo la primera vez en cada teléfono)
+  let rom = await kvGet(id);
+  const needEmulator = !(await emulatorCached());
+
   if (!rom && ROM_SERVER) {
-    showSetup(`Descargando ${GAMES[id].title}...`, "Solo la primera vez");
-    try { rom = await downloadRom(token); await kvPut(id, rom); }
-    catch (e) { return showSetup("Error", e.message); }
+    // Primera vez en este teléfono: ROM y emulador se descargan a la vez.
+    showSetup(`Descargando ${GAMES[id].title}...`, "Solo la primera vez: juego y emulador");
+    try {
+      const [r] = await Promise.all([downloadRom(token), needEmulator ? warmup(id) : null]);
+      rom = r;
+      await kvPut(id, rom);
+    } catch (e) { return showSetup("Error", e.message); }
+  } else if (needEmulator) {
+    showSetup("Preparando el emulador...", "Solo la primera vez");
+    await warmup(id);
   }
 
   // Carga manual (solo si no hay servidor configurado)
@@ -253,7 +264,7 @@ function start(id, rom, fresh) {
         const check = await kvGet(id);
         if (!check || !check.size) throw new Error("No se pudo guardar en el navegador");
         input.hidden = true;
-        showTap(id, check, fresh);   // sin recargar la página
+        ready(id, check, fresh);   // sin recargar la página
       } catch (err) {
         $("sub").textContent = "Error: " + err.message;
         input.value = "";
@@ -262,18 +273,8 @@ function start(id, rom, fresh) {
     return;
   }
 
-  showTap(id, rom, fresh);
+  ready(id, rom, fresh);
 })();
-
-// ROM lista: pedir un toque para arrancar (evita pantalla en blanco)
-function showTap(id, rom, fresh) {
-  $("setup").hidden = true;
-  $("tapTitle").textContent = GAMES[id].title;
-  $("tap").hidden = false;
-  $("tapBtn").onclick = () => start(id, rom, fresh);
-}
-
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
 </body>
 </html>
