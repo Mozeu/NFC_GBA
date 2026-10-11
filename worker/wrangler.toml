@@ -7,8 +7,8 @@ binding = "ROMS"
 bucket_name = "roms"
 
 [vars]
-# Solo el origen, sin ruta ni barra final
+# Solo el origen, sin ruta ni barra final y en minúsculas
 ALLOWED_ORIGIN = "https://mozeu.github.io"
 
-# El token NO va aquí. Se guarda como secreto:
-#   npx wrangler secret put TOKEN
+# Los tokens NO van aquí. Se guardan como secreto (tools/generar-tokens.mjs imprime el valor):
+#   npx wrangler secret put TOKENS --name roms

@@ -24,19 +24,24 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-// TOKENS -> lista de [token, archivo]. Si el JSON está mal, no autoriza a nadie.
+// TOKENS -> lista de [token, archivo]. Si algo está mal, no autoriza a nadie.
+// El nombre de archivo viene de TU configuración (no de quien hace la petición), así que
+// puede tener espacios, paréntesis, etc.: es la clave exacta del objeto en R2.
+// Los avisos van solo al registro del Worker (npx wrangler tail --name roms), nunca al cliente.
 function parseTokens(raw) {
-  try {
-    const out = [];
-    for (const [t, file] of Object.entries(JSON.parse(raw || "{}"))) {
-      if (t.length >= MIN_TOKEN && typeof file === "string" && SAFE_NAME.test(file)) {
-        out.push([t, file]);
-      }
-    }
-    return out;
-  } catch {
+  if (!raw) { console.warn("TOKENS no está configurado en este Worker"); return []; }
+  let obj;
+  try { obj = JSON.parse(raw); } catch { console.warn("TOKENS no es un JSON válido"); return []; }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    console.warn("TOKENS debe ser un objeto JSON {token: archivo}");
     return [];
   }
+  const out = [];
+  for (const [t, file] of Object.entries(obj)) {
+    if (t.length >= MIN_TOKEN && typeof file === "string" && file.length > 0) out.push([t, file]);
+    else console.warn("TOKENS: se ignora una entrada (token de menos de 16 caracteres o archivo vacío)");
+  }
+  return out;
 }
 
 export default {
@@ -58,7 +63,8 @@ export default {
 
     // 1) Modo nuevo: el token decide el archivo. La ruta de la petición se ignora.
     let key = null;
-    for (const [t, file] of parseTokens(env.TOKENS)) {
+    const tokens = parseTokens(env.TOKENS);
+    for (const [t, file] of tokens) {
       if (safeEqual(token, t)) key = file;   // sin "break": el tiempo no depende de cuál acierta
     }
 
@@ -70,7 +76,11 @@ export default {
       key = name;
     }
 
-    if (key === null) return reply("No autorizado", 401);
+    if (key === null) {
+      // Pista para depurar con "npx wrangler tail --name roms". No incluye ningún token.
+      console.log(`401: tokens cargados=${tokens.length}, longitud del token recibido=${token.length}`);
+      return reply("No autorizado", 401);
+    }
 
     const obj = await env.ROMS.get(key);
     if (!obj) return reply("No existe", 404);
