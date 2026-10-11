@@ -1,11 +1,18 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "roms",
+  "main": "worker/worker.js",
   "compatibility_date": "2026-10-06",
   "observability": {
     "enabled": true
   },
-  "assets": {
-    "directory": "."
+  "r2_buckets": [
+    {
+      "binding": "ROMS",
+      "bucket_name": "roms"
+    }
+  ],
+  "vars": {
+    "ALLOWED_ORIGIN": "https://mozeu.github.io"
   }
 }
